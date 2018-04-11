@@ -27,6 +27,7 @@
 #include "php.h"
 #include "php_ini.h"
 #include "ext/standard/info.h"
+#include "ext/standard/php_var.h"
 #include "php_jansson.h"
 
 static inline void* jsson_malloc(size_t len) {
@@ -37,12 +38,21 @@ static inline void jsson_free(void *block) {
 	efree(block);
 }
 
+#if PHP_VERSION_ID < 70000
 static inline json_t* json_encode_zend(zval **zvalue TSRMLS_DC) {
+#else
+static inline json_t* json_encode_zend(zval *zvalue TSRMLS_DC) {
+#endif
 	json_t *json = NULL;
 	HashTable *hash = NULL;
 	HashPosition position;
+#if PHP_VERSION_ID < 70000
 	zval **zivalue;
-	
+#else
+	zval *zivalue;
+#endif
+
+#if PHP_VERSION_ID < 70000
 	switch (Z_TYPE_PP(zvalue)) {
 		case IS_LONG:
 			return json_integer(Z_LVAL_PP(zvalue));
@@ -74,16 +84,49 @@ static inline json_t* json_encode_zend(zval **zvalue TSRMLS_DC) {
 				zend_hash_get_current_data_ex(hash, (void**)&zivalue, &position) == SUCCESS;
 				zend_hash_move_forward_ex(hash, &position)) {
 				if (zend_hash_get_current_key_ex(hash, &key, &klen, &kdx, 0, &position) == HASH_KEY_IS_STRING) {
-					json_obect_set(json, key, json_encode_zend(zivalue TSRMLS_CC));
+					json_object_set(json, key, json_encode_zend(zivalue TSRMLS_CC));
 				}
 			}
 		}
+#else
+	switch (Z_TYPE_P(zvalue)) {
+		case IS_LONG:
+			return json_integer(Z_LVAL_P(zvalue));
+
+		case IS_DOUBLE:
+			return json_real(Z_DVAL_P(zvalue));
+
+		case IS_ARRAY:
+			hash = Z_ARRVAL_P(zvalue);
+
+        case IS_OBJECT: {
+            zend_string *key = NULL;
+            zend_ulong klen = 0;
+
+            if (!hash) {
+                hash = Z_OBJPROP_P(zvalue);
+            }
+
+            json = json_object();
+
+            for (zend_hash_internal_pointer_reset_ex(hash, &position);
+				 (zivalue = zend_hash_get_current_data_ex(hash, &position));
+                 zend_hash_move_forward_ex(hash, &position)) {
+                if (zend_hash_get_current_key_ex(hash, &key, &klen, &position) == HASH_KEY_IS_STRING) {
+                    json_object_set(json, ZSTR_VAL(key), json_encode_zend(zivalue TSRMLS_CC));
+                }
+            }
+        }
+#endif
+		case IS_NULL:
+			return json_null();
 	}
-	
+
 	return json;
 }
 
 static inline zval* json_decode_zend(json_t **json TSRMLS_DC) {
+#if PHP_VERSION_ID < 7000
 	zval* retval = EG(uninitialized_zval_ptr);
 	
 	if (json && *json) {
@@ -95,7 +138,6 @@ static inline zval* json_decode_zend(json_t **json TSRMLS_DC) {
 			case JSON_STRING:
 				ALLOC_INIT_ZVAL(retval);
 				ZVAL_STRING(retval, json_string_value(*json), 1);
-
 			break;
 			
 			case JSON_INTEGER:
@@ -146,8 +188,65 @@ static inline zval* json_decode_zend(json_t **json TSRMLS_DC) {
 	} else {
 		Z_ADDREF_P(retval);
 	}
-	
-	return retval;
+
+    return retval;
+#else
+    zval* retval = emalloc(sizeof(zval));
+
+    if (json && *json) {
+        switch (json_typeof(*json)) {
+            case JSON_NULL:
+                ZVAL_NULL(retval);
+            break;
+
+            case JSON_STRING:
+                ZVAL_STRINGL(retval, json_string_value(*json), 1);
+            break;
+
+            case JSON_INTEGER:
+                ZVAL_LONG(retval, json_integer_value(*json));
+            break;
+
+            case JSON_REAL:
+                ZVAL_DOUBLE(retval, json_real_value(*json));
+            break;
+
+            case JSON_TRUE:
+            case JSON_FALSE:
+                ZVAL_BOOL(retval, json_boolean_value(*json));
+            break;
+
+            case JSON_OBJECT: {
+                const char *jkey;
+                json_t *jvalue;
+
+                array_init(retval);
+
+                json_object_foreach(*json, jkey, jvalue) {
+                    add_assoc_zval(retval, jkey, json_decode_zend(&jvalue TSRMLS_CC));
+                }
+            } break;
+
+            case JSON_ARRAY: {
+                size_t jkey;
+                json_t *jvalue;
+
+                array_init(retval);
+
+                json_array_foreach(*json, jkey, jvalue) {
+                    add_index_zval(retval, jkey, json_decode_zend(&jvalue TSRMLS_CC));
+                }
+            } break;
+
+            default:
+                zend_error(E_ERROR, "unknown tyep : %d\n", json_typeof(*json));
+        }
+    } else {
+        Z_ADDREF_P(retval);
+    }
+
+    return retval;
+#endif
 }
 
 /* {{{ proto string jsson_encode(mixed variable)
@@ -162,11 +261,15 @@ PHP_FUNCTION(jsson_encode)
 
 	{
 		json_t *json;
-		json_error_t error;
 		HashTable *hash = NULL;
 		HashPosition position;
+
+#if PHP_VERSION_ID < 70000
 		zval **zvalue;
-		
+#else
+        zval *zvalue;
+#endif
+
 		switch (Z_TYPE_P(variable)) {
 			case IS_NULL:
 				json = json_null();
@@ -184,8 +287,12 @@ PHP_FUNCTION(jsson_encode)
 				hash = Z_ARRVAL_P(variable);
 			
 			case IS_OBJECT: {
-				char *key = NULL;
+#if PHP_VERSION_ID < 70000
+                char *key = NULL;
 				zend_uint klen = 0;
+#else
+                zend_string *key;
+#endif
 				zend_ulong kdx = 0L;
 				
 				if (!hash) {
@@ -195,14 +302,21 @@ PHP_FUNCTION(jsson_encode)
 				json = json_object();
 				
 				for (zend_hash_internal_pointer_reset_ex(hash, &position);
-					zend_hash_get_current_data_ex(hash, (void**)&zvalue, &position) == SUCCESS;
+#if PHP_VERSION_ID < 70000
+                    zend_hash_get_current_data_ex(hash, (void**)&zvalue, &position) == SUCCESS;
+#else
+                    (zvalue = zend_hash_get_current_data_ex(hash, &position));
+#endif
 					zend_hash_move_forward_ex(hash, &position)) {
 					json_t *next = NULL;
-					if (zend_hash_get_current_key_ex(
-						hash, &key, &klen, &kdx, 0, &position) == HASH_KEY_IS_STRING) {
+#if PHP_VERSION_ID < 70000
+					if (zend_hash_get_current_key_ex(hash, &key, &klen, &kdx, 0, &position) == HASH_KEY_IS_STRING) {
+#else
+					if (zend_hash_get_current_key_ex(hash, &key, &kdx, &position) == HASH_KEY_IS_STRING) {
+#endif
 						next = json_encode_zend(zvalue TSRMLS_CC);
 						if (next) {
-							json_object_set(json, key, next);
+							json_object_set(json, ZSTR_VAL(key), next);
 							json_decref(next);
 						}
 					}
@@ -211,7 +325,11 @@ PHP_FUNCTION(jsson_encode)
 		}
 		
 		if (json) {
+#if PHP_VERSION_ID < 70000
 			ZVAL_STRING(return_value, json_dumps(json, 0), 0);
+#else
+			ZVAL_STRING(return_value, json_dumps(json, 0));
+#endif
 			json_decref(json);
 		}
 	}
@@ -222,8 +340,12 @@ PHP_FUNCTION(jsson_encode)
 PHP_FUNCTION(jsson_decode)
 {
 	char *str;
+#if PHP_VERSION_ID < 70000
 	zend_uint slen;
-	
+#else
+    zend_long slen;
+#endif
+
 	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &str, &slen) == FAILURE) {
 		return;
 	}

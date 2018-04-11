@@ -27,7 +27,6 @@
 #include "php.h"
 #include "php_ini.h"
 #include "ext/standard/info.h"
-#include "ext/standard/php_var.h"
 #include "php_jansson.h"
 
 static inline void* jsson_malloc(size_t len) {
